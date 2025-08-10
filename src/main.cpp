@@ -1,74 +1,146 @@
 #include "headers.h"
 
 #include <boost/asio.hpp>
-#include <boost/asio/io_service.hpp>
-#include <boost/asio/co_spawn.hpp>
-#include <boost/asio/detached.hpp>
-#include <boost/asio/read_until.hpp>
-#include <boost/asio/use_awaitable.hpp>
+#include <boost/asio/experimental/awaitable_operators.hpp>
 
-#include <string_view>
 #include <iostream>
+#include <string_view>
 
-using boost::asio::io_service;
-using boost::asio::co_spawn;
-using boost::asio::async_read_until;
-using boost::asio::awaitable;
-using boost::asio::use_awaitable;
+namespace ba = boost::asio;
+
+using ba::ip::tcp;
 using boost::system::error_code;
-using boost::asio::buffer;
-using boost::asio::dynamic_buffer;
-using boost::asio::transfer_at_least;
-using boost::asio::ip::tcp;
 
+ba::awaitable<void> session(tcp::socket clientSocket, ba::io_service &ioService) {
+    try {
+        std::string clientBuf;
+        co_await ba::async_read_until(clientSocket, ba::dynamic_buffer(clientBuf), "\r\n\r\n", ba::use_awaitable);
 
-constexpr std::string_view delimiter = "\r\n\r\n";
+        auto [host, port] = findHostPort(std::string_view(clientBuf.data(), clientBuf.size()));
+        if (host.empty()) {
+            clientSocket.close();
+            co_return;
+        }
+        std::string port_s = port.empty() ? "80" : port;
 
+        tcp::resolver resolver(ioService);
+        auto endpoints = co_await resolver.async_resolve(host, port_s, ba::use_awaitable);
 
-awaitable<void> session(tcp::socket client_socket, io_service& io_service)
-{
-  // code here
+        tcp::socket serverSocket(ioService);
+        co_await ba::async_connect(serverSocket, endpoints, ba::use_awaitable);
+
+        co_await ba::async_write(serverSocket, ba::buffer(clientBuf.data(), clientBuf.size()), ba::use_awaitable);
+
+        std::string serverBuf;
+        co_await ba::async_read_until(serverSocket, ba::dynamic_buffer(serverBuf), "\r\n\r\n", ba::use_awaitable);
+
+        co_await ba::async_write(clientSocket, ba::buffer(serverBuf.data(), serverBuf.size()), ba::use_awaitable);
+
+        auto cl = findContentLength(std::string_view(serverBuf.data(), serverBuf.size()));
+        if (cl) {
+            auto pos = std::string_view(serverBuf).find("\r\n\r\n");
+            size_t headerEnd = (pos == std::string_view::npos) ? serverBuf.size() : pos + 4;
+            size_t already = serverBuf.size() - headerEnd;
+            size_t remaining = 0;
+            if (*cl > already)
+                remaining = *cl - already;
+            else
+                remaining = 0;
+
+            while (remaining > 0) {
+                size_t want = remaining < 8192 ? remaining : 8192;
+                std::size_t before = serverBuf.size();
+                try {
+                    co_await ba::async_read(serverSocket, ba::dynamic_buffer(serverBuf), ba::transfer_at_least(want),
+                                            ba::use_awaitable);
+                } catch (const std::exception &) {
+                    // При возникновении исключения мы просто пытаемся переслать то, что уже прочитали, и прерываем
+                    // выполнение
+                }
+                std::size_t after = serverBuf.size();
+                if (after > before) {
+                    co_await ba::async_write(clientSocket, ba::buffer(serverBuf.data() + before, after - before),
+                                             ba::use_awaitable);
+                    size_t forwarded = after - before;
+                    if (forwarded >= remaining)
+                        remaining = 0;
+                    else
+                        remaining -= forwarded;
+                } else {
+                    break;
+                }
+            }
+        } else {
+            // Нет Content-Length: читать до закрытия сервера (или возникновения ошибки) и пересылать
+            while (true) {
+                std::size_t before = serverBuf.size();
+                bool read_ok = true;
+                try {
+                    co_await ba::async_read(serverSocket, ba::dynamic_buffer(serverBuf), ba::transfer_at_least(1),
+                                            ba::use_awaitable);
+                } catch (const std::exception &) {
+                    read_ok = false;
+                }
+
+                std::size_t after = serverBuf.size();
+                if (after > before) {
+                    co_await ba::async_write(clientSocket, ba::buffer(serverBuf.data() + before, after - before),
+                                             ba::use_awaitable);
+                }
+
+                if (!read_ok)
+                    break;
+            }
+        }
+
+        boost::system::error_code ec1, ec2;
+        clientSocket.shutdown(tcp::socket::shutdown_both, ec1);
+        clientSocket.close(ec1);
+        serverSocket.shutdown(tcp::socket::shutdown_both, ec2);
+        serverSocket.close(ec2);
+
+    } catch (const std::exception &e) {
+        clientSocket.close();
+    }
+    co_return;
 }
 
-class Server
-{
+class Server {
 public:
-  Server(io_service& io_service, short port)
-    : io_service_(io_service)
-    , acceptor_(io_service, tcp::endpoint(tcp::v4(), port))
-    , socket_(io_service)
-  {
-    do_accept();
-  }
+    Server(ba::io_context &io_context, unsigned short port)
+        : _ioContext(io_context), _acceptor(io_context, tcp::endpoint(tcp::v4(), port)), _socket(io_context) {
+        do_accept();
+    }
 
 private:
-  void do_accept()
-  {
-    acceptor_.async_accept(socket_,
-      [this](error_code ec)
-      {
-        // code here
-      }
-    );
-  }
+    void do_accept() {
+        _acceptor.async_accept(_socket, [this](error_code ec) {
+            if (!ec) {
+                tcp::socket clientSocket = std::move(_socket);
+                _socket = tcp::socket(_ioContext);
+                ba::co_spawn(_ioContext, session(std::move(clientSocket), _ioContext), ba::detached);
+            }
+            do_accept();
+        });
+    }
 
-  io_service& io_service_;
-  tcp::acceptor acceptor_;
-  tcp::socket socket_;
+    ba::io_context &_ioContext;
+    tcp::acceptor _acceptor;
+    tcp::socket _socket;
 };
 
-int main(int argc, char* argv[]) {
-  try {
-    if (argc != 2) {
-      std::cerr << "Usage: proxy_server";
-      std::cerr << " <listen_port>\n";
-      return 1;
-    }
-    io_service io_service(1);
-    Server server(io_service, std::atoi(argv[1]));
-    io_service.run();
+int main(int argc, char *argv[]) {
+    try {
+        if (argc != 2) {
+            std::cerr << "Usage: proxy_server";
+            std::cerr << " <listen_port>\n";
+            return 1;
+        }
+        ba::io_service ioService(1);
+        Server server(ioService, std::atoi(argv[1]));
+        ioService.run();
 
-  } catch (const std::exception& e) {
-    std::cerr << "Exception: " << e.what() << std::endl;
-  }
+    } catch (const std::exception &e) {
+        std::cerr << "Exception: " << e.what() << std::endl;
+    }
 }
