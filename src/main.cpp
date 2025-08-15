@@ -3,6 +3,7 @@
 #include <boost/asio.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
 
+#include <format>
 #include <iostream>
 #include <string_view>
 
@@ -11,7 +12,9 @@ namespace ba = boost::asio;
 using ba::ip::tcp;
 using boost::system::error_code;
 
-ba::awaitable<void> session(tcp::socket clientSocket, ba::io_service &ioService) {
+constexpr size_t THRESHOLD = 8192;
+
+ba::awaitable<void> session(tcp::socket clientSocket, ba::io_context &ioContext) {
     try {
         std::string clientBuf;
         co_await ba::async_read_until(clientSocket, ba::dynamic_buffer(clientBuf), "\r\n\r\n", ba::use_awaitable);
@@ -23,10 +26,10 @@ ba::awaitable<void> session(tcp::socket clientSocket, ba::io_service &ioService)
         }
         std::string port_s = port.empty() ? "80" : port;
 
-        tcp::resolver resolver(ioService);
+        tcp::resolver resolver(ioContext);
         auto endpoints = co_await resolver.async_resolve(host, port_s, ba::use_awaitable);
 
-        tcp::socket serverSocket(ioService);
+        tcp::socket serverSocket(ioContext);
         co_await ba::async_connect(serverSocket, endpoints, ba::use_awaitable);
 
         co_await ba::async_write(serverSocket, ba::buffer(clientBuf.data(), clientBuf.size()), ba::use_awaitable);
@@ -48,14 +51,13 @@ ba::awaitable<void> session(tcp::socket clientSocket, ba::io_service &ioService)
                 remaining = 0;
 
             while (remaining > 0) {
-                size_t want = remaining < 8192 ? remaining : 8192;
+                size_t want = std::min(remaining, THRESHOLD);
                 std::size_t before = serverBuf.size();
                 try {
                     co_await ba::async_read(serverSocket, ba::dynamic_buffer(serverBuf), ba::transfer_at_least(want),
                                             ba::use_awaitable);
                 } catch (const std::exception &) {
-                    // При возникновении исключения мы просто пытаемся переслать то, что уже прочитали, и прерываем
-                    // выполнение
+                    // При возникновении исключения — попытаемся переслать то, что прочитали, и прервём.
                 }
                 std::size_t after = serverBuf.size();
                 if (after > before) {
@@ -71,7 +73,6 @@ ba::awaitable<void> session(tcp::socket clientSocket, ba::io_service &ioService)
                 }
             }
         } else {
-            // Нет Content-Length: читать до закрытия сервера (или возникновения ошибки) и пересылать
             while (true) {
                 std::size_t before = serverBuf.size();
                 bool read_ok = true;
@@ -96,11 +97,8 @@ ba::awaitable<void> session(tcp::socket clientSocket, ba::io_service &ioService)
         boost::system::error_code ec1, ec2;
         clientSocket.shutdown(tcp::socket::shutdown_both, ec1);
         clientSocket.close(ec1);
-        serverSocket.shutdown(tcp::socket::shutdown_both, ec2);
-        serverSocket.close(ec2);
-
     } catch (const std::exception &e) {
-        clientSocket.close();
+            clientSocket.close();
     }
     co_return;
 }
@@ -132,15 +130,23 @@ private:
 int main(int argc, char *argv[]) {
     try {
         if (argc != 2) {
-            std::cerr << "Usage: proxy_server";
-            std::cerr << " <listen_port>\n";
+            std::cerr << "Usage: proxy_server <listen_port>\n";
             return 1;
         }
-        ba::io_service ioService(1);
-        Server server(ioService, std::atoi(argv[1]));
-        ioService.run();
+        ba::io_context ioContext(1);
+
+        auto port = ParsePort(argv[1]);
+        if (!port) {
+            std::cerr << std::format("Invalid port: '{}'. Port must be integer in range 1..65535.\n", argv[1]);
+            return 2;
+        }
+
+        Server server(ioContext, *port);
+        ioContext.run();
 
     } catch (const std::exception &e) {
         std::cerr << "Exception: " << e.what() << std::endl;
+        return 3;
     }
+    return 0;
 }

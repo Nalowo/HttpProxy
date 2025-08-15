@@ -72,6 +72,13 @@ TEST(findHostPort, NoHost) {
     EXPECT_TRUE(port.empty());
 }
 
+TEST(findHostPort, BrokenPortString) {
+    std::string headers = "GET / HTTP/1.1\r\nHost: example.com:unreadable\r\n\r\n";
+    auto [host, port] = findHostPort(headers);
+    EXPECT_EQ(host, "example.com");
+    EXPECT_EQ(port, "unreadable"); // текущая реализация возвращает всё после ':' как port
+}
+
 TEST(findContentLength, Simple) {
     std::string headers = "HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\n";
     auto content_length = findContentLength(headers);
@@ -81,6 +88,12 @@ TEST(findContentLength, Simple) {
 
 TEST(findContentLength, NoContentLength) {
     std::string headers = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
+    auto content_length = findContentLength(headers);
+    EXPECT_FALSE(content_length.has_value());
+}
+
+TEST(findContentLength, TooLargeIgnored) {
+    std::string headers = "HTTP/1.1 200 OK\r\nContent-Length: 1000000000000\r\n\r\n"; // 1e12 > 1e9 limit
     auto content_length = findContentLength(headers);
     EXPECT_FALSE(content_length.has_value());
 }
