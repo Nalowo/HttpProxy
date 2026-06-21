@@ -1,58 +1,64 @@
-# cpp-middle-project-sprint-7 <!-- omit in toc -->
+# HttpProxy (AsyncHttpProxy)
 
-- [Начало работы](#начало-работы)
-- [Сборка проекта и запуск тестов](#сборка-проекта-и-запуск-тестов)
-  - [Команды для сборки проекта](#команды-для-сборки-проекта)
-  - [Команды для запуска приложения](#команды-для-запуска-приложения)
-  - [Команда для запуска тестов](#команда-для-запуска-тестов)
+> Асинхронный HTTP-прокси-сервер на Boost.Asio и корутинах C++20.
 
-Шаблон репозитория для практического задания 7-го спринта «Мидл разработчик С++»
+Прокси принимает HTTP-запросы клиентов, извлекает целевой хост и порт из заголовков, устанавливает соединение с сервером, пересылает запрос и транслирует ответ обратно клиенту. Весь сетевой ввод-вывод неблокирующий и построен на **корутинах C++20** (`co_await`) поверх `boost::asio`.
 
-## Начало работы
+## Возможности
 
-1. Нажмите зелёную кнопку `Use this template`, затем `Create a new repository`.
-2. Назовите свой репозиторий.
-3. Склонируйте созданный репозиторий командой `git clone your-repository-name`.
-4. Создайте новую ветку командой `git switch -c development`.
-5. Откройте проект в `Visual Studio Code`.
-6. Нажмите `F1` и откройте проект в dev-контейнере командой `Dev Containers: Reopen in Container`.
+- Приём подключений и обработка каждой сессии как отдельной корутины.
+- Разбор HTTP-заголовков, извлечение `Host`/порта и `Content-Length`.
+- Корректная пересылка тела ответа порциями (потоковая передача больших ответов с порогом буферизации).
+- Асинхронное разрешение DNS, подключение, чтение и запись без блокировки потока.
 
-## Сборка проекта и запуск тестов
+## Технологии и концепции C++
 
-Данный репозиторий использует три инструмента:
+- **Корутины C++20:** `boost::asio::awaitable<>`, `co_await`, `co_spawn`, `use_awaitable`.
+- **Boost.Asio:** `io_context`, `tcp::socket`, `tcp::resolver`, `async_read_until`, `async_connect`, `async_read`, `async_write`, `dynamic_buffer`, `transfer_at_least`.
+- Парсинг заголовков на `std::string_view` без лишних копий; `std::optional` для опциональных результатов.
+- `std::function`-колбэк для итерации по заголовкам.
 
-- **cmake** — генератор систем сборки для C и C++. Позволяет создавать проекты, которые могут компилироваться на различных платформах и с различными компиляторами. Подробнее о cmake:
-  - https://dzen.ru/a/ZzZGUm-4o0u-IQlb
-  - https://neerc.ifmo.ru/wiki/index.php?title=CMake_Tutorial
-  - https://cmake.org/cmake/help/book/mastering-cmake/cmake/Help/guide/tutorial/index.html
+## Архитектура
 
-- **VS Code Dev Docker container** - Docker контейнер, который содержит полностью настроенное окружение для выполнение задания. Подробнее об этой функциональности:
-  - https://habr.com/ru/articles/822707/ - "Почти все, что вы хотели бы знать про Docker"
-  - https://code.visualstudio.com/docs/devcontainers/containers - официальная документация VS Code
-  - https://www.youtube.com/watch?v=p9L7YFqHGk4 - "Docker container for VS Code"
-  - https://www.youtube.com/watch?v=pg19Z8LL06w&t=174s&pp=ygUPRG9ja2VyY29udGFpbmVy - "Docker in 1 hour"
+```
+main → io_context → co_spawn(session) на каждое подключение
+session (awaitable<void>):
+  read_until("\r\n\r\n")  → разбор заголовков (findHostPort)
+  resolve + connect       → соединение с целевым сервером
+  write(запрос)           → пересылка запроса
+  read ответа             → findContentLength → потоковая пересылка тела клиенту
+```
 
-### Команды для сборки проекта
+Вспомогательные функции парсинга (`iterHeaders`, `findHostPort`, `findContentLength`, `ParsePort`) вынесены в отдельный модуль и покрыты тестами.
 
-- Создайте папку `build`
-- Перейдите в нее `cd build`
-- Запустите `cmake ..`
-- Запустите `make`
+## Стек
 
-### Команды для запуска приложения
+`C++20` · `Boost.Asio (coroutines)` · `CMake` · `GoogleTest`
+
+## Сборка
+
+```bash
+mkdir build && cd build
+cmake ..
+make
+```
+
+## Запуск
+
+Поднять прокси на порту 5555 и проверить через локальный сервер-заглушку:
 
 ```bash
 cd build
-
 ./AsyncHttpProxy 5555 &
 
+# тестовый сервер-заглушка
 python3 -c 'print("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 4096\r\n\r\n" + "A"*4096, end="")' | nc -l 127.0.0.1 -p 8000 &
 
+# запрос через прокси
 wget -e use_proxy=yes -e http_proxy=127.0.0.1:5555 127.0.0.1:8000
-
 ```
 
-### Команда для запуска тестов
+## Тесты
 
 ```bash
 cd build
